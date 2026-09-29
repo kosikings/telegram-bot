@@ -1,29 +1,42 @@
 /**
  * Local dead-letter queue for Telegram sends that exhausted in-cycle retries.
  *
- * Failed notifications are persisted to a flat JSON file so a transient
- * Telegram outage (rate limit, brief network blip) can be replayed after the
- * chain cursor has already advanced. The queue is bounded: when full, the
- * oldest entry is dropped so a permanently broken token cannot grow the file
- * without limit. Entries that exceed the attempt budget are also dropped.
+ * Before this, a send that failed every retry was dropped and counted: the
+ * cursor advanced (correct — the chain is the source of truth, and a broken
+ * token must not wedge the poller) but the notification was gone, and the only
+ * trace was one `notificationsFailed` tick and an audit line. The queue parks
+ * those messages on disk instead, so a rate limit or a short Telegram outage
+ * costs a delay rather than the message.
  *
- * The chain remains the source of truth. This queue never holds signing keys,
- * bot tokens, or unbounded remote payloads — only the already-formatted
- * MarkdownV2 text the notifier was about to send, plus short operational
- * metadata (source, ledger, event name, truncated last error).
+ * Bounded on every axis, because none of the inputs are trusted:
+ *
+ *  - Depth: `maxEntries`; the oldest entry is dropped when the queue is full, so
+ *    a permanently broken token cannot grow the file without limit.
+ *  - Attempts: an entry that fails `maxAttempts` replays is a poison entry and
+ *    is dropped, so a message Telegram will never accept cannot be retried
+ *    forever.
+ *  - Size: the message body and the recorded error are both truncated.
+ *  - Content: the stored error goes through `safeErrorMessage`, so a token or a
+ *    seed strkey in an upstream error cannot be persisted to the file (the same
+ *    rule that governs every other operator-facing string).
+ *
+ * The queue holds only already-formatted MarkdownV2 text plus short operational
+ * metadata. It never holds signing keys or bot tokens.
  */
 
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { safeErrorMessage } from "./notifications/format.js";
+
 export interface DeadLetterEntry {
-  /** Stable id within the queue (source + ledger + event + short hash of text). */
+  /** Stable id within the queue (source + ledger + event + short text hash). */
   id: string;
   enqueuedAt: string;
   source: string;
   ledger: number;
   eventName: string;
-  /** Already-formatted MarkdownV2 message body. */
+  /** Already-formatted MarkdownV2 message body, truncated to {@link TEXT_TRUNCATE}. */
   text: string;
   attempts: number;
   lastError: string | null;
@@ -43,26 +56,40 @@ export interface DeadLetterStats {
 }
 
 export interface DeadLetterQueueOptions {
-  filePath: string;
+  /**
+   * Where the queue lives. `null` disables persistence and loading: the queue
+   * then works in memory only, which is how a caller that predates the setting
+   * (a hand-built config in a test, a tool) keeps its old behaviour with no
+   * file access at all.
+   */
+  filePath: string | null;
   maxEntries: number;
   maxAttempts: number;
+  /**
+   * Config secrets to scrub from a recorded error, passed straight to
+   * `safeErrorMessage`. The poller hands over its bot token: a Telegram failure
+   * routinely embeds the token in the request URL, and main's shape rule
+   * deliberately does not match a token that follows the literal `bot` prefix in
+   * a URL, so the value itself is what makes that case safe.
+   */
+  secrets?: readonly string[];
   /** Optional clock for deterministic tests. */
   now?: () => number;
 }
 
-const ERROR_TRUNCATE = 200;
-const TEXT_TRUNCATE = 4_000;
+export const DEAD_LETTER_MAX_ENTRIES = 100;
+export const DEAD_LETTER_MAX_ATTEMPTS = 10;
 
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
+const ERROR_TRUNCATE = 200;
+/** Telegram's own message ceiling (4,096) minus room for the queue's own text. */
+const TEXT_TRUNCATE = 4_000;
 
 function truncate(value: string, max: number): string {
   if (value.length <= max) return value;
   return `${value.slice(0, max)}…`;
 }
 
-/** Short non-crypto fingerprint so duplicate failures dedupe within a cycle. */
+/** Short non-crypto fingerprint so duplicate failures collapse into one entry. */
 function shortHash(text: string): string {
   let h = 0;
   for (let i = 0; i < text.length; i++) {
@@ -71,6 +98,7 @@ function shortHash(text: string): string {
   return (h >>> 0).toString(16).padStart(8, "0");
 }
 
+/** Identity of a parked message: the same event failing twice is one entry. */
 export function makeEntryId(
   source: string,
   ledger: number,
@@ -82,6 +110,7 @@ export function makeEntryId(
 
 export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   const now = options.now ?? Date.now;
+  const filePath = options.filePath;
   let entries: DeadLetterEntry[] = [];
   const stats: DeadLetterStats = {
     depth: 0,
@@ -90,15 +119,27 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     dropped: 0,
   };
 
+  /** Redacted, truncated error text — the only form that may be persisted. */
+  function safeError(err: unknown): string {
+    return truncate(safeErrorMessage(err, options.secrets ?? []), ERROR_TRUNCATE);
+  }
+
   function syncDepth(): void {
     stats.depth = entries.length;
   }
 
   async function load(): Promise<void> {
+    if (filePath === null) {
+      entries = [];
+      syncDepth();
+      return;
+    }
+
     let raw: string;
     try {
-      raw = await readFile(options.filePath, "utf8");
+      raw = await readFile(filePath, "utf8");
     } catch {
+      // No file yet is the normal first-run case, not a problem to report.
       entries = [];
       syncDepth();
       return;
@@ -108,7 +149,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       const parsed = JSON.parse(raw) as DeadLetterFile;
       if (parsed.version !== 1 || !Array.isArray(parsed.entries)) {
         console.warn(
-          `[dead-letter] unknown or corrupt file at ${options.filePath}; starting empty`,
+          `[dead-letter] unknown or corrupt queue at ${filePath}; starting empty`,
         );
         entries = [];
       } else {
@@ -122,16 +163,16 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
           )
           .map((e) => ({
             id: e.id,
-            enqueuedAt: typeof e.enqueuedAt === "string" ? e.enqueuedAt : new Date(now()).toISOString(),
+            enqueuedAt:
+              typeof e.enqueuedAt === "string" ? e.enqueuedAt : new Date(now()).toISOString(),
             source: typeof e.source === "string" ? e.source : "unknown",
             ledger: e.ledger,
             eventName: typeof e.eventName === "string" ? e.eventName : "unknown",
             text: truncate(e.text, TEXT_TRUNCATE),
             attempts: typeof e.attempts === "number" && e.attempts >= 0 ? e.attempts : 0,
-            lastError:
-              typeof e.lastError === "string" ? truncate(e.lastError, ERROR_TRUNCATE) : null,
+            lastError: typeof e.lastError === "string" ? truncate(e.lastError, ERROR_TRUNCATE) : null,
           }));
-        // Bound on load in case the file was edited by hand.
+        // Bound on load too: the file may have been edited by hand.
         while (entries.length > options.maxEntries) {
           entries.shift();
           stats.dropped += 1;
@@ -139,29 +180,37 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       }
     } catch (err) {
       console.warn(
-        `[dead-letter] unreadable file at ${options.filePath}, starting empty: ${errorMessage(err)}`,
+        `[dead-letter] unreadable queue at ${filePath}, starting empty: ${safeError(err)}`,
       );
       entries = [];
     }
     syncDepth();
     if (entries.length > 0) {
-      console.log(`[dead-letter] loaded ${entries.length} pending send(s) from ${options.filePath}`);
+      console.log(`[dead-letter] loaded ${entries.length} parked send(s) from ${filePath}`);
     }
   }
 
   async function persist(): Promise<void> {
+    if (filePath === null) {
+      syncDepth();
+      return;
+    }
     const payload: DeadLetterFile = {
       version: 1,
       updatedAt: new Date(now()).toISOString(),
       entries,
     };
     try {
-      await mkdir(path.dirname(options.filePath), { recursive: true });
-      const tmp = `${options.filePath}.tmp`;
+      await mkdir(path.dirname(filePath), { recursive: true });
+      // Write-then-rename, like the cursor and status files: a reader never sees
+      // a half-written queue, and a crash leaves the previous one intact.
+      const tmp = `${filePath}.tmp`;
       await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-      await rename(tmp, options.filePath);
+      await rename(tmp, filePath);
     } catch (err) {
-      console.error(`[dead-letter] could not persist queue: ${errorMessage(err)}`);
+      // An unwritable queue is degraded observability, never a reason to stop
+      // notifying or to throw into the poll loop.
+      console.error(`[dead-letter] could not persist queue: ${safeError(err)}`);
     }
     syncDepth();
   }
@@ -177,12 +226,12 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     const existing = entries.find((e) => e.id === id);
     if (existing) {
       existing.attempts += 1;
-      existing.lastError = truncate(errorMessage(input.error), ERROR_TRUNCATE);
+      existing.lastError = safeError(input.error);
       await persist();
       return existing;
     }
 
-    while (entries.length >= options.maxEntries) {
+    while (entries.length >= Math.max(1, options.maxEntries)) {
       const dropped = entries.shift();
       stats.dropped += 1;
       if (dropped) {
@@ -201,13 +250,13 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       eventName: input.eventName,
       text: truncate(input.text, TEXT_TRUNCATE),
       attempts: 1,
-      lastError: truncate(errorMessage(input.error), ERROR_TRUNCATE),
+      lastError: safeError(input.error),
     };
     entries.push(entry);
     stats.enqueued += 1;
     syncDepth();
     console.warn(
-      `[dead-letter] enqueued ${entry.source} ${entry.eventName} @ ledger ${entry.ledger} ` +
+      `[dead-letter] parked ${entry.source} ${entry.eventName} @ ledger ${entry.ledger} ` +
         `(depth ${entries.length}/${options.maxEntries}): ${entry.lastError}`,
     );
     await persist();
@@ -215,12 +264,13 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
   }
 
   /**
-   * Attempt to resend queued messages, oldest first.
-   * Stops after `budget` successful sends (or when the queue is empty).
-   * Does not throw — send failures update the entry in place.
+   * Resend parked messages, oldest first. Stops after `budget` successful sends
+   * so one recovery cannot flood the channel. Never throws: a failed replay
+   * updates the entry in place, and a poison entry is dropped once it has used
+   * its attempts.
    */
   async function flush(
-    send: (text: string) => Promise<void>,
+    send: (text: string, entry: DeadLetterEntry) => Promise<void>,
     budget: number,
   ): Promise<{ sent: number; remaining: number }> {
     if (budget <= 0 || entries.length === 0) {
@@ -237,7 +287,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
       }
 
       try {
-        await send(entry.text);
+        await send(entry.text, entry);
         sent += 1;
         stats.replayed += 1;
         console.log(
@@ -245,7 +295,7 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
         );
       } catch (err) {
         entry.attempts += 1;
-        entry.lastError = truncate(errorMessage(err), ERROR_TRUNCATE);
+        entry.lastError = safeError(err);
         if (entry.attempts >= options.maxAttempts) {
           stats.dropped += 1;
           console.error(
@@ -255,8 +305,9 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
         } else {
           kept.push(entry);
           console.warn(
-            `[dead-letter] replay failed for ${entry.source} ${entry.eventName} @ ledger ${entry.ledger} ` +
-              `(attempt ${entry.attempts}/${options.maxAttempts}): ${entry.lastError}`,
+            `[dead-letter] replay failed for ${entry.source} ${entry.eventName} ` +
+              `@ ledger ${entry.ledger} (attempt ${entry.attempts}/${options.maxAttempts}): ` +
+              entry.lastError,
           );
         }
       }
