@@ -7,8 +7,11 @@
  * state. All chain logic lives in `src/poller.ts` and `src/stellar/`.
  */
 
+import type { UserFromGetMe } from "grammy/types";
+import { Bot, type Context } from "grammy";
 import { Bot, type Context, type CommandContext } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
+import { performance } from "node:perf_hooks";
 
 import { escapeMd, previewMessage, safeErrorMessage, type ExplorerKeyboard } from "./notifications/format.js";
 import { formatFeatureFlags } from "./notifications/featureFlags.js";
@@ -53,6 +56,8 @@ function visibleCommands(config?: BotConfig) {
   );
 }
 
+export function helpMessage(config: BotConfig): string {
+  if (config.operatorTelegramUserId === null) return HELP_BASE.join("\n");
 function helpMessage(config: BotConfig): string {
   return [
     HELP_TITLE,
@@ -65,7 +70,7 @@ function helpMessage(config: BotConfig): string {
   ].join("\n");
 }
 
-const TELEGRAM_OPTIONS = {
+export const TELEGRAM_OPTIONS = {
   parse_mode: "MarkdownV2" as const,
   link_preview_options: { is_disabled: true },
 };
@@ -96,7 +101,7 @@ function cursorPreview(cursor: string | null): string {
   return compact.length <= 24 ? compact : `${compact.slice(0, 23)}…`;
 }
 
-function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = Date.now()): string {
+export function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = Date.now()): string {
   const lifecycle = status.stopping
     ? "stopping"
     : status.paused
@@ -113,7 +118,7 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
     `Chain clock skew: ${escapeMd(chainClockLabel(status.chainClockAt, nowMs))}`,
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt, nowMs)}`,
-    `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}` +
+    `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped} · deduped ${status.eventsDeduplicated ?? 0}` +
       (status.notificationsDropped
         ? ` · dropped during shutdown ${status.notificationsDropped}`
         : ""),
@@ -142,21 +147,30 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
 
   for (const target of status.targets) {
     lines.push(
-      `· mimir\\-${target.source} \`${target.contractId}\``,
+      `· mimir\\-${target.source} \\(${escapeMd(target.version ?? "v1")}\\) \`${target.contractId}\``,
       `  last event ledger: ${target.lastEventLedger ?? "none seen"}`,
       `  cursor: \`${cursorPreview(target.cursor)}\``,
     );
+    if (target.cursorStalled) {
+      lines.push(
+        `  cursor stalled: unchanged for ${target.cyclesWithoutAdvance} successful cycles while behind tip`,
+      );
+    }
     if (target.lastError) lines.push(`  last error: ${escapeMd(target.lastError)}`);
   }
 
   if (status.lastError) {
     lines.push(
       "",
+      `Last error \\(${ago(status.lastError.at)}\\): ${escapeMd(clipError(status.lastError.message))}`,
       `Last error \\(${ago(status.lastError.at, nowMs)}\\): ${escapeMd(status.lastError.message)}`,
     );
   }
   if (status.consecutiveFailures > 0) {
     lines.push(`Consecutive failed cycles: ${status.consecutiveFailures}`);
+  }
+  if (status.restartGaps > 0) {
+    lines.push(`Restart gaps detected since start: ${status.restartGaps}`);
   }
 
   if (status.stopping) {
@@ -169,6 +183,24 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
   }
 
   return lines.join("\n");
+}
+
+export function lastEventMessage(config: BotConfig, status: PollerStatus): string {
+  const lines = [`*Last observed events* — Stellar ${networkLabel(config)}`, ""];
+
+  for (const target of status.targets) {
+    lines.push(`*mimir\-${target.source}*`);
+    if (target.lastEvent === null) {
+      lines.push("No event has been observed since this process started\.", "");
+      continue;
+    }
+    lines.push(formatLastEvent(config, target.lastEvent), "");
+  }
+
+  if (status.targets.length === 0) {
+    lines.push("No contract scan has completed yet\.");
+  }
+  return lines.join("\n").trimEnd();
 }
 
 /**
@@ -215,12 +247,30 @@ export function healthMessage(
           : `  ALERT: stale cursor recovery from ledger ${target.rewindFromLedger}`,
       );
     }
+    if (target.gapLedgers > 0) {
+      lines.push(
+        `  restart gap: ${target.gapLedgers} ledger(s) unrecoverable at the last recovery`,
+      );
+    }
+    if (target.cursorUnreadable) {
+      lines.push("  cursor ledger unreadable: position forwarded unchanged");
+    }
     if (target.hasError) {
       const targetState = status.targets.find((t) => t.source === target.source);
       if (targetState?.lastError) {
         lines.push(`  last error: ${escapeMd(targetState.lastError)}`);
       }
     }
+  }
+
+  if (report.poller.restartGaps > 0) {
+    const gap = report.poller.lastRestartGap;
+    lines.push(
+      escapeMd(
+        `Restart gaps since start: ${report.poller.restartGaps}` +
+          (gap ? ` (last: ${gap.missedLedgers} ledger(s) unrecoverable on ${gap.source})` : ""),
+      ),
+    );
   }
 
   if (report.poller.lastError) {
@@ -244,9 +294,17 @@ export function healthMessage(
 }
 
 export function contractsMessage(config: BotConfig): string {
-  const targets: Array<{ label: string; contractId: string }> = [
-    { label: "mimir\\-market", contractId: config.marketContractId },
-    { label: "mimir\\-squad", contractId: config.squadContractId },
+  const targets: Array<{ label: string; version: string; contractId: string }> = [
+    {
+      label: "mimir\\-market",
+      version: config.marketContractVersion ?? "v1",
+      contractId: config.marketContractId,
+    },
+    {
+      label: "mimir\\-squad",
+      version: config.squadContractVersion ?? "v1",
+      contractId: config.squadContractId,
+    },
   ];
 
   const lines: string[] = [
@@ -258,7 +316,7 @@ export function contractsMessage(config: BotConfig): string {
   for (const target of targets) {
     lines.push(
       "",
-      `*${target.label}*`,
+      `*${target.label}* \\(${escapeMd(target.version ?? "v1")}\\)`,
       `\`${escapeMd(target.contractId)}\``,
       `[View on stellar\\.expert](${contractExplorerUrl(config, target.contractId)})`,
     );
@@ -293,6 +351,8 @@ export function resumeMessage(result: PollerResumeResult): string {
 export interface BotDeps {
   config: BotConfig;
   status: () => PollerStatus;
+  pause: () => PollerPauseResult;
+  resume: () => PollerResumeResult;
   /** Live in-memory audit window; renders immediately even before a flush. */
   audit?: AuditLog | undefined;
   /** Where the audit JSONL file lives, for the file-backed report. */
@@ -302,8 +362,11 @@ export interface BotDeps {
    * getMe() call so `bot.handleUpdate()` works without a real Telegram token.
    */
   botInfo?: UserFromGetMe;
-  pause: () => PollerPauseResult;
-  resume: () => PollerResumeResult;
+}
+
+function isOperator(ctx: Context, config: BotConfig): boolean {
+  const operatorId = config.operatorTelegramUserId;
+  return operatorId !== null && ctx.from?.id.toString() === operatorId;
 }
 
 /**
@@ -330,8 +393,13 @@ function isOperator(ctx: Context, config: BotConfig): boolean {
 const AUDIT_TAIL = 10;
 
 /** Register command handlers on a grammy-compatible bot (also useful in tests). */
-export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
-  const { config, status, pause, resume } = deps;
+export function registerCommandHandlers(
+  bot: Bot | { command: (name: string, handler: (ctx: Context) => Promise<void>) => void },
+  deps: BotDeps,
+): void {
+  const { config, status } = deps;
+  const pause = deps.pause ?? (() => "stopped");
+  const resume = deps.resume ?? (() => "stopped");
 
   const handlers: Record<typeof COMMANDS[number]["command"], (ctx: CommandContext<Context>) => Promise<void>> = {
     start: async (ctx) => {
@@ -353,7 +421,17 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
         );
         return;
       }
-      await ctx.reply(statusMessage(config, status()), TELEGRAM_OPTIONS);
+      const startedAt = performance.now();
+      let sent = false;
+      try {
+        await ctx.reply(statusMessage(config, status()), TELEGRAM_OPTIONS);
+        sent = true;
+      } finally {
+        const latencyMs = Math.max(0, performance.now() - startedAt);
+        console.info(
+          `[bot] /status ${sent ? "sent" : "failed"} in ${latencyMs.toFixed(1)}ms`,
+        );
+      }
     },
 
     audit: async (ctx) => {
@@ -429,8 +507,26 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
 }
 
 export function createBot(deps: BotDeps): Bot {
+  const bot = new Bot(
+    deps.config.botToken,
+    deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined,
+  );
   const bot = new Bot(deps.config.botToken, deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined);
   registerCommandHandlers(bot, deps);
+  registerCallbackHandlers(bot, deps);
+
+  bot.command("export", async (ctx) => {
+    if (!logs || logs.capacity() === 0) {
+      await ctx.reply("Log export is disabled (LOG_BUFFER_LINES=0).");
+      return;
+    }
+    // Plain text, no parse mode: the content is redacted but untrusted, and
+    // MarkdownV2 would make any escaping slip a parsing error instead of a
+    // cosmetic wart.
+    await ctx.reply(renderLogExport(config, status(), logs), {
+      link_preview_options: { is_disabled: true },
+    });
+  });
 
   // grammy rethrows handler errors by default, which would take the process
   // with it. Keep Telegram/RPC error text bounded and redact known secrets.
@@ -458,6 +554,12 @@ export interface SendExtra {
    * Bounded identifiers for fallback logging only. Optional; never sent.
    */
   eventRef?: { eventId?: string | undefined; ledger?: number | undefined; source?: string | undefined } | undefined;
+  /**
+   * Post the notification as a reply to this message, for chats that thread
+   * their notifications. Optional: omitted from the payload entirely when
+   * absent, so the send is byte-identical to the unthreaded one.
+   */
+  replyToMessageId?: number | undefined;
 }
 
 /**
@@ -522,6 +624,9 @@ export function createNotifier(bot: Bot, config: BotConfig) {
       await bot.api.sendMessage(chatId, text, {
         ...TELEGRAM_OPTIONS,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+        ...(extra?.replyToMessageId !== undefined
+          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+          : {}),
       });
       return;
     } catch (err) {
@@ -542,6 +647,9 @@ export function createNotifier(bot: Bot, config: BotConfig) {
       await bot.api.sendMessage(chatId, fallback, {
         ...PLAIN_TEXT_OPTIONS,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+        ...(extra?.replyToMessageId !== undefined
+          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+          : {}),
       });
     }
   };
