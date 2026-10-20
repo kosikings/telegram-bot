@@ -46,6 +46,14 @@ import {
 import { helpDetailMessage } from "./commands/help-detail.js";
 import { aboutMessage } from "./commands/about.js";
 export { helpDetailMessage, COMMAND_DETAILS, type CommandDetail } from "./commands/help-detail.js";
+export {
+  handlePingCommand,
+  pingCommand,
+  pongMessage,
+  formatPong,
+  type PingDeps,
+  type Clock,
+} from "./commands/ping.js";
 import {
   handleBroadcastCallback,
   registerBroadcastHandlers,
@@ -653,7 +661,7 @@ export interface BotDeps {
  *   id (stored as a number in grammy's ctx.chat.id) and its string form are
  *   compared so that negative group ids such as -1001234567890 match correctly.
  */
-function isChatAllowed(allowedChatIds: readonly string[] | undefined, chatId: number): boolean {
+export function isChatAllowed(allowedChatIds: readonly string[] | undefined, chatId: number): boolean {
   // Hand-built configs (tests, embedders) may omit the list: treat it as open.
   if (!allowedChatIds || allowedChatIds.length === 0) return true;
   const asString = String(chatId);
