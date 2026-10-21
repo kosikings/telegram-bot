@@ -46,6 +46,7 @@ import {
 import { helpDetailMessage } from "./commands/help-detail.js";
 import { aboutMessage } from "./commands/about.js";
 export { helpDetailMessage, COMMAND_DETAILS, type CommandDetail } from "./commands/help-detail.js";
+import { handlePingCommand } from "./commands/ping.js";
 export {
   handlePingCommand,
   pingCommand,
@@ -70,6 +71,7 @@ export const COMMANDS = [
   { command: "contracts", description: COMMAND_DESCRIPTIONS.contracts, operatorOnly: false },
   { command: "health", description: COMMAND_DESCRIPTIONS.health, operatorOnly: false },
   { command: "preview", description: COMMAND_DESCRIPTIONS.preview, operatorOnly: false },
+  { command: "ping", description: COMMAND_DESCRIPTIONS.ping, operatorOnly: false },
   { command: "pause", description: COMMAND_DESCRIPTIONS.pause, operatorOnly: true },
   { command: "resume", description: COMMAND_DESCRIPTIONS.resume, operatorOnly: true },
 ] as const;
@@ -811,6 +813,10 @@ export function registerCommandHandlers(
       const spaceIndex = text.indexOf(" ");
       const arg = spaceIndex !== -1 ? text.slice(spaceIndex + 1).trim() : "";
       await ctx.reply(previewMessage(config, arg || "market"), TELEGRAM_OPTIONS);
+    },
+
+    ping: async (ctx) => {
+      await handlePingCommand(ctx, { config });
     },
 
     pause: async (ctx) => {
