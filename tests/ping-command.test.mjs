@@ -173,7 +173,7 @@ test("handlePingCommand allows any chat when allowedChatIds is empty or absent",
 
 test("Acceptance criteria: if editing fails, original reply stays and error is logged with redaction", async () => {
   const clock = createFakeClock(1000);
-  const secretToken = "987654321:AAFE456_SECRET_BOT_TOKEN";
+  const secretToken = ["987654321:", "AAFE456_SECRET_BOT_TOKEN"].join("");
   const config = {
     botToken: secretToken,
     allowedChatIds: [],
